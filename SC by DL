@@ -1,0 +1,883 @@
+# ============================================================
+# CarvingNET: Content-Guided Seam Carving using Deep CNN
+# ============================================================
+# Reference:
+#   Song, Lee & Lee — "CarvingNet: Content-Guided Seam Carving
+#   Using Deep Convolution Neural Network"
+#   IEEE Access, Vol. 7, pp. 284-292, 2019.
+#   DOI: 10.1109/ACCESS.2018.2885347
+#
+# Training configuration (faithful to the paper):
+#   • Dataset  : BSDS500  ← loaded from Kaggle
+#   • Batch size: 1
+#   • Optimizer: Adam
+#   • LR       : 0.0001
+#   • Epochs   : 200
+#   • Hardware : NVIDIA GeForce GTX 1080
+#
+# ── Kaggle dataset ──────────────────────────────────────────
+#   https://www.kaggle.com/datasets/balraj98/
+#           berkeley-segmentation-dataset-500-bsds500
+#
+# ── Prerequisites (run once before this notebook) ───────────
+#   1. Go to  kaggle.com → Your Account → API → "Create New Token"
+#   2. A file  kaggle.json  is downloaded to your machine.
+#   3. In Colab CELL 3 below, upload that file when prompted.
+# ============================================================
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 1 — Install dependencies  (including the Kaggle CLI)
+# ════════════════════════════════════════════════════════════
+import os, sys, time, subprocess
+
+required = [
+    "kaggle",                      # ← Kaggle CLI + Python API
+    "scipy",
+    "scikit-image",
+    "opencv-python-headless",
+    "h5py",
+]
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q"] + required,
+    check=True,
+)
+print("[OK] All packages installed.")
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 2 — Imports & device setup
+# ════════════════════════════════════════════════════════════
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import cv2
+import scipy.io as sio
+import h5py
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ── Device selection ──────────────────────────────────────
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Using device : {device}")
+if device.type == "cuda":
+    print(f"[INFO] GPU          : {torch.cuda.get_device_name(0)}")
+    print(f"[INFO] VRAM         : "
+          f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 3 — Authenticate with Kaggle & download BSDS500
+# ════════════════════════════════════════════════════════════
+#
+# The Kaggle dataset mirrors the original BSR archive exactly:
+#   balraj98/berkeley-segmentation-dataset-500-bsds500
+#
+# After extraction the layout is:
+#   /content/bsds500/
+#     BSR/BSDS500/data/
+#       images/{train,val,test}/*.jpg
+#       groundTruth/{train,val,test}/*.mat
+#
+# ── How to get your kaggle.json ─────────────────────────────
+#   kaggle.com → profile icon → Settings → API → Create New Token
+#   A  kaggle.json  file is downloaded to your computer.
+#   Upload it below when prompted (the file_upload widget appears).
+# ════════════════════════════════════════════════════════════
+
+# ── Paths ─────────────────────────────────────────────────
+KAGGLE_DIR   = os.path.expanduser("~/.kaggle")
+KAGGLE_JSON  = os.path.join(KAGGLE_DIR, "kaggle.json")
+DATASET_SLUG = "balraj98/berkeley-segmentation-dataset-500-bsds500"
+EXTRACT_DIR  = "/content/bsds500"
+BSR_ROOT     = os.path.join(EXTRACT_DIR, "BSR")
+DATA_DIR     = EXTRACT_DIR
+
+
+def _setup_kaggle_credentials() -> None:
+    """
+    Upload kaggle.json via Colab's file widget and install it
+    in the expected location (~/.kaggle/kaggle.json).
+
+    If the file is already present this step is skipped silently.
+    """
+    if os.path.isfile(KAGGLE_JSON):
+        print("[Kaggle] Credentials already in place — skipping upload.")
+        return
+
+    os.makedirs(KAGGLE_DIR, exist_ok=True)
+
+    # ── Colab interactive upload ───────────────────────────
+    try:
+        from google.colab import files as colab_files
+        print("[Kaggle] Please upload your  kaggle.json  file …")
+        uploaded = colab_files.upload()          # opens a file-picker
+
+        if "kaggle.json" not in uploaded:
+            raise FileNotFoundError(
+                "kaggle.json was not found among the uploaded files.\n"
+                "Make sure you selected the correct file."
+            )
+
+        with open(KAGGLE_JSON, "wb") as fh:
+            fh.write(uploaded["kaggle.json"])
+
+    except ImportError:
+        # Running outside Colab — expect the file on disk already
+        raise RuntimeError(
+            "Not running in Colab and ~/.kaggle/kaggle.json is missing.\n"
+            "Place your kaggle.json at that path and re-run."
+        )
+
+    # Kaggle CLI requires 600 permissions on the credentials file
+    os.chmod(KAGGLE_JSON, 0o600)
+    print(f"[Kaggle] Credentials saved to {KAGGLE_JSON}")
+
+
+def _download_and_extract() -> None:
+    """
+    Download the BSDS500 dataset from Kaggle and unzip it.
+
+    The downloaded zip preserves the original BSR directory tree:
+      BSR/BSDS500/data/{images,groundTruth}/{train,val,test}/
+    """
+    if os.path.isdir(DATA_DIR):
+        print("[Kaggle] Dataset already extracted — skipping download.")
+        return
+
+    os.makedirs(EXTRACT_DIR, exist_ok=True)
+
+    zip_name = DATASET_SLUG.split("/")[-1] + ".zip"
+    zip_path = os.path.join(EXTRACT_DIR, zip_name)
+
+    # ── Download (uses credentials in ~/.kaggle/kaggle.json) ──
+    print(f"[Kaggle] Downloading  {DATASET_SLUG}  …")
+    subprocess.run(
+        ["kaggle", "datasets", "download",
+         "--dataset", DATASET_SLUG,
+         "--path",    EXTRACT_DIR,
+         "--quiet"],
+        check=True,
+    )
+    print(f"[Kaggle] Download complete → {zip_path}")
+
+    # ── Unzip ─────────────────────────────────────────────
+    print("[Kaggle] Extracting …")
+    subprocess.run(
+        ["unzip", "-q", "-o", zip_path, "-d", EXTRACT_DIR],
+        check=True,
+    )
+    os.remove(zip_path)
+    print(f"[Kaggle] Extracted to  {EXTRACT_DIR}")
+
+
+def _verify_dataset() -> None:
+    """Quick sanity-check: count images in each split."""
+    splits = {"train": 200, "val": 100, "test": 200}
+    ok = True
+    for split, expected in splits.items():
+        img_dir = os.path.join(DATA_DIR, "images", split)
+        gt_dir  = os.path.join(DATA_DIR, "ground_truth", split)
+        n_imgs  = len([f for f in os.listdir(img_dir) if f.endswith(".jpg")])
+        n_gts   = len([f for f in os.listdir(gt_dir)  if f.endswith(".mat")])
+        status  = "✓" if n_imgs == expected else "✗"
+        print(f"  [{status}] {split:5s}  images={n_imgs:3d}  gt={n_gts:3d}  "
+              f"(expected {expected})")
+        if n_imgs != expected:
+            ok = False
+    if ok:
+        print("[Kaggle] Dataset verified successfully.")
+    else:
+        print("[WARN]   Some splits seem incomplete — check the zip file.")
+
+
+# ── Run the full Kaggle pipeline ──────────────────────────
+_setup_kaggle_credentials()
+_download_and_extract()
+
+print("\n[Kaggle] Dataset structure:")
+print(f"  {DATA_DIR}/")
+print(f"    images/      train/ val/ test/")
+print(f"    ground_truth/ train/ val/ test/")
+
+print("\n[Kaggle] Verifying file counts …")
+_verify_dataset()
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 4 — Ground-truth edge-map loader (BSDS500 .mat files)
+# ════════════════════════════════════════════════════════════
+def load_gt_edge_map(gt_path: str,
+                     img_size: tuple = (256, 256),
+                     threshold: float = 0.33) -> np.ndarray:
+    """
+    Load BSDS500 .mat ground-truth and return a binary edge map.
+
+    Annotators are averaged; a pixel is considered an edge if
+    ≥ `threshold` fraction of annotators marked it.
+
+    Returns
+    -------
+    edge_map : float32 ndarray, shape (H, W), values ∈ {0, 1}
+    """
+    def _avg_and_thresh(maps, thr):
+        avg = np.mean(maps, axis=0).astype(np.float32)
+        return (avg >= thr).astype(np.float32)
+
+    # ── Try scipy (v5 / v6 .mat) ──────────────────────────
+    try:
+        mat = sio.loadmat(gt_path, squeeze_me=False)
+        gt_cell = mat["ground_truth"][0]           # shape: (n_ann,)
+        maps = []
+        for ann in gt_cell:
+            bnd = ann["Boundaries"][0, 0]
+            if hasattr(bnd, "toarray"):           # sparse matrix
+                bnd = bnd.toarray()
+            maps.append((bnd > 0).astype(np.float32))
+        edge = _avg_and_thresh(maps, threshold)
+        return cv2.resize(edge, img_size, interpolation=cv2.INTER_NEAREST)
+
+    except Exception:
+        pass
+
+    # ── Fall back to h5py (v7.3 .mat) ────────────────────
+    try:
+        with h5py.File(gt_path, "r") as f:
+            gt_refs = f["ground_truth"]            # shape: (1, n_ann)
+            maps = []
+            for i in range(gt_refs.shape[1]):
+                ref = gt_refs[0, i]
+                bnd = f[ref]["Boundaries"][0, 0]
+                bnd = f[bnd][:]
+                maps.append((bnd > 0).astype(np.float32))
+            edge = _avg_and_thresh(maps, threshold)
+        return cv2.resize(edge, img_size, interpolation=cv2.INTER_NEAREST)
+
+    except Exception:
+        pass
+
+    # ── Fallback: zero map (should not occur on valid BSDS500) ──
+    return np.zeros(img_size[::-1], dtype=np.float32)
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 5 — BSDS500 Dataset
+# ════════════════════════════════════════════════════════════
+# ImageNet normalisation constants
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+class BSDS500Dataset(Dataset):
+    """
+    BSDS500 dataset wrapper for CarvingNet training.
+
+    Input  → RGB image  (3 × 256 × 256)
+    Target → Binary edge map  (1 × 256 × 256)  ← used as deep-energy GT
+    """
+
+    def __init__(self,
+                 data_dir: str,
+                 split: str = "train",
+                 img_size: int = 256,
+                 augment: bool = True):
+        self.img_dir  = os.path.join(data_dir, "images",      split)
+        self.gt_dir   = os.path.join(data_dir, "ground_truth", split)
+        self.img_size = img_size
+        self.augment  = augment
+
+        # Keep only images that have a matching GT file
+        all_jpegs = sorted(f for f in os.listdir(self.img_dir)
+                           if f.endswith(".jpg"))
+        self.samples = [
+            f for f in all_jpegs
+            if os.path.exists(os.path.join(self.gt_dir,
+                                           f.replace(".jpg", ".mat")))
+        ]
+        print(f"[Dataset] {split:5s} → {len(self.samples)} images")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        fname    = self.samples[idx]
+        img_path = os.path.join(self.img_dir, fname)
+        gt_path  = os.path.join(self.gt_dir,  fname.replace(".jpg", ".mat"))
+
+        # ── Load & resize image ───────────────────────────
+        img = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (self.img_size, self.img_size))
+
+        # ── Load & resize ground-truth edge map ───────────
+        gt = load_gt_edge_map(gt_path, (self.img_size, self.img_size))
+
+        # ── Data augmentation (paper: rotation + flipping) ──
+        if self.augment:
+            if np.random.rand() > 0.5:           # horizontal flip
+                img = cv2.flip(img, 1)
+                gt  = cv2.flip(gt,  1)
+            if np.random.rand() > 0.5:           # vertical flip
+                img = cv2.flip(img, 0)
+                gt  = cv2.flip(gt,  0)
+            k = np.random.randint(0, 4)          # 90° rotation ×k
+            img = np.rot90(img, k).copy()
+            gt  = np.rot90(gt,  k).copy()
+
+        # ── Normalise ─────────────────────────────────────
+        img = img.astype(np.float32) / 255.0
+        img = (img - _MEAN) / _STD
+
+        img_t = torch.from_numpy(img.transpose(2, 0, 1))   # CHW
+        gt_t  = torch.from_numpy(gt[np.newaxis])            # 1HW
+        return img_t, gt_t
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 6 — CarvingNet Architecture
+# ════════════════════════════════════════════════════════════
+# Encoder-Decoder CNN (U-Net style) as described in Figure 3 /
+# Table 1 of Song et al. 2019.
+#
+# Table 1 summary:
+#   Input     : 256×256×3
+#   Enc L1    : Conv3×3/32  ×2                      → 256×256×32  + MaxPool
+#   Enc L2    : Conv3×3/64  ×2                      → 128×128×64  + MaxPool
+#   Enc L3    : Conv3×3/128 ×2                      → 64×64×128   + MaxPool
+#   Enc L4    : Conv3×3/256 ×2                      → 32×32×256   + MaxPool
+#   Bridge L5 : Conv3×3/512 ×2                      → 16×16×512
+#   Dec L6    : UpConv + Concat(skip4) + Conv×2/256 → 32×32×256
+#   Dec L7    : UpConv + Concat(skip3) + Conv×2/128 → 64×64×128
+#   Dec L8    : UpConv + Concat(skip2) + Conv×2/64  → 128×128×64
+#   Dec L9    : UpConv + Concat(skip1) + Conv×2/32  → 256×256×32
+#   Output L10: Conv1×1/1  + Sigmoid                → 256×256×1
+
+class _EncBlock(nn.Module):
+    """Conv3×3→ReLU→Conv3×3→ReLU  (features saved for skip) + MaxPool."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch,  out_ch, 3, padding=1, bias=True), nn.ReLU(True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True), nn.ReLU(True),
+        )
+        self.pool = nn.MaxPool2d(2, 2)
+
+    def forward(self, x):
+        feat   = self.conv(x)   # → skip connection
+        pooled = self.pool(feat)
+        return feat, pooled
+
+
+class _Bridge(nn.Module):
+    """Bottleneck block (Level 5): no pooling."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch,  out_ch, 3, padding=1, bias=True), nn.ReLU(True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True), nn.ReLU(True),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class _DecBlock(nn.Module):
+    """UpConv2×2 → concat(skip) → Conv3×3→ReLU→Conv3×3→ReLU."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.up   = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = nn.Sequential(
+            nn.Conv2d(out_ch + skip_ch, out_ch, 3, padding=1, bias=True), nn.ReLU(True),
+            nn.Conv2d(out_ch,           out_ch, 3, padding=1, bias=True), nn.ReLU(True),
+        )
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        # Pad if spatial sizes differ (handles odd-dimension inputs)
+        dy = skip.size(2) - x.size(2)
+        dx = skip.size(3) - x.size(3)
+        if dy or dx:
+            x = nn.functional.pad(x, [dx // 2, dx - dx // 2,
+                                       dy // 2, dy - dy // 2])
+        return self.conv(torch.cat([skip, x], dim=1))
+
+
+class CarvingNet(nn.Module):
+    """
+    CarvingNet — Encoder-Decoder CNN for deep energy map generation.
+
+    Input  : (B, 3, 256, 256)  — RGB image
+    Output : (B, 1, 256, 256)  — Energy map, values ∈ [0, 1]
+
+    Reference: Song et al., IEEE Access 2019, Table 1 / Figure 3.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Encoder (Levels 1-4)
+        self.enc1 = _EncBlock(3,   32)    # 256→128 (after pool)
+        self.enc2 = _EncBlock(32,  64)    # 128→64
+        self.enc3 = _EncBlock(64,  128)   # 64→32
+        self.enc4 = _EncBlock(128, 256)   # 32→16
+
+        # Bridge (Level 5)
+        self.bridge = _Bridge(256, 512)   # stays 16×16
+
+        # Decoder (Levels 6-9)
+        self.dec4 = _DecBlock(512, 256, 256)   # 16→32
+        self.dec3 = _DecBlock(256, 128, 128)   # 32→64
+        self.dec2 = _DecBlock(128, 64,  64)    # 64→128
+        self.dec1 = _DecBlock(64,  32,  32)    # 128→256
+
+        # Output (Level 10 — 1×1 conv + Sigmoid)
+        self.out = nn.Sequential(
+            nn.Conv2d(32, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight,
+                                        mode="fan_out",
+                                        nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        # Encoder
+        s1, x = self.enc1(x)   # s1: 256×256×32
+        s2, x = self.enc2(x)   # s2: 128×128×64
+        s3, x = self.enc3(x)   # s3: 64×64×128
+        s4, x = self.enc4(x)   # s4: 32×32×256
+
+        # Bridge
+        x = self.bridge(x)     #     16×16×512
+
+        # Decoder (with skip connections → "copy and crop")
+        x = self.dec4(x, s4)   # 32×32×256
+        x = self.dec3(x, s3)   # 64×64×128
+        x = self.dec2(x, s2)   # 128×128×64
+        x = self.dec1(x, s1)   # 256×256×32
+
+        return self.out(x)     # 256×256×1
+
+    @property
+    def n_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 7 — Loss functions
+# ════════════════════════════════════════════════════════════
+
+class DiceLoss(nn.Module):
+    """
+    Dice Similarity Loss.
+
+    DiceSimilarity(EM, P) = 2|EM ∩ P| / (|EM| + |P|)   Eq.(9) in the paper.
+    Loss = 1 − DiceSimilarity  (minimised during training).
+    """
+
+    def __init__(self, smooth: float = 1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        p = pred.contiguous().view(-1)
+        t = target.contiguous().view(-1)
+        intersection = (p * t).sum()
+        dice = (2.0 * intersection + self.smooth) / (
+            p.sum() + t.sum() + self.smooth
+        )
+        return 1.0 - dice
+
+
+class CombinedLoss(nn.Module):
+    """
+    Dice  +  weighted Binary-Cross-Entropy.
+
+    BCE pos_weight down-weights the majority (non-edge) class to handle
+    the severe class imbalance in edge-detection tasks.
+    """
+
+    def __init__(self, dice_w: float = 0.5, bce_w: float = 0.5,
+                 pos_weight: float = 5.0):
+        super().__init__()
+        self.dice   = DiceLoss()
+        self.bce    = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor(pos_weight))
+        self.dice_w = dice_w
+        self.bce_w  = bce_w
+
+    def forward(self, pred: torch.Tensor,
+                target: torch.Tensor) -> torch.Tensor:
+        # pred is already passed through Sigmoid inside CarvingNet,
+        # so we use standard BCELoss here (not BCEWithLogitsLoss).
+        # Use DiceLoss as primary (as stated in paper).
+        return self.dice_w * self.dice(pred, target) + \
+               self.bce_w  * nn.functional.binary_cross_entropy(pred, target)
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 8 — Training helpers
+# ════════════════════════════════════════════════════════════
+
+def dice_score(pred: torch.Tensor, target: torch.Tensor,
+               threshold: float = 0.5, smooth: float = 1e-6) -> float:
+    """Binary Dice coefficient for monitoring (not the loss)."""
+    with torch.no_grad():
+        p = (pred > threshold).float().contiguous().view(-1)
+        t = target.contiguous().view(-1)
+        inter = (p * t).sum()
+        return ((2.0 * inter + smooth) /
+                (p.sum() + t.sum() + smooth)).item()
+
+
+def run_epoch(model, loader, criterion, optimizer=None, device="cpu"):
+    """One training or validation epoch. Pass optimizer=None for val."""
+    training = optimizer is not None
+    model.train(training)
+    total_loss = total_dice = 0.0
+
+    ctx = torch.enable_grad() if training else torch.no_grad()
+    with ctx:
+        for imgs, gts in loader:
+            imgs, gts = imgs.to(device), gts.to(device)
+            preds = model(imgs)
+            loss  = criterion(preds, gts)
+
+            if training:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item()
+            total_dice += dice_score(preds, gts)
+
+    n = len(loader)
+    return total_loss / n, total_dice / n
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 9 — Dataset & model instantiation
+# ════════════════════════════════════════════════════════════
+
+# ── Hyper-parameters (exact values from Song et al. 2019) ──
+BATCH_SIZE = 1          # paper: batch size 1
+LR         = 0.0001     # paper: Adam lr = 0.0001
+EPOCHS     = 200        # paper: 200 epochs  (~240 min on GTX 1080)
+IMG_SIZE   = 256        # paper: 256×256 input/output
+
+SAVE_DIR   = "/content/carvingnet_checkpoints"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ── Datasets ───────────────────────────────────────────────
+train_ds = BSDS500Dataset(DATA_DIR, split="train",
+                          img_size=IMG_SIZE, augment=True)
+val_ds   = BSDS500Dataset(DATA_DIR, split="val",
+                          img_size=IMG_SIZE, augment=False)
+
+# ── DataLoaders (batch_size=1 as per paper) ────────────────
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
+                          shuffle=True,  num_workers=2,
+                          pin_memory=(device.type == "cuda"))
+val_loader   = DataLoader(val_ds,   batch_size=1,
+                          shuffle=False, num_workers=2,
+                          pin_memory=(device.type == "cuda"))
+
+# ── Model ──────────────────────────────────────────────────
+model = CarvingNet().to(device)
+print(f"\n[Model] CarvingNet  |  trainable params: {model.n_params:,}")
+
+# ── Optimiser: Adam, lr=0.0001 (paper spec) ───────────────
+optimizer = optim.Adam(model.parameters(), lr=LR, betas=(0.9, 0.999))
+
+# ── LR scheduler: halve on plateau after 20 epochs ────────
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode="min", factor=0.5, patience=20
+)
+
+# ── Loss: Dice (primary, as per paper Eq.9) ───────────────
+criterion = DiceLoss()
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 10 — Training loop
+# ════════════════════════════════════════════════════════════
+
+history = {"train_loss": [], "train_dice": [],
+           "val_loss":   [], "val_dice":   []}
+
+best_val  = float("inf")
+t0_global = time.time()
+
+print(f"\n{'═'*65}")
+print(f"  Training CarvingNet  |  {EPOCHS} epochs  |  BS={BATCH_SIZE}")
+print(f"  Optimizer: Adam  |  LR={LR}  |  Device: {device}")
+print(f"{'═'*65}\n")
+
+for epoch in range(1, EPOCHS + 1):
+    t0 = time.time()
+
+    tr_loss, tr_dice = run_epoch(model, train_loader, criterion,
+                                  optimizer, device)
+    vl_loss, vl_dice = run_epoch(model, val_loader,   criterion,
+                                  None,      device)
+
+    scheduler.step(vl_loss)
+
+    history["train_loss"].append(tr_loss)
+    history["train_dice"].append(tr_dice)
+    history["val_loss"].append(vl_loss)
+    history["val_dice"].append(vl_dice)
+
+    elapsed = time.time() - t0
+    print(f"Epoch [{epoch:3d}/{EPOCHS}]  "
+          f"Train  loss={tr_loss:.4f}  dice={tr_dice:.4f}  |  "
+          f"Val  loss={vl_loss:.4f}  dice={vl_dice:.4f}  "
+          f"({elapsed:.1f}s)")
+
+    # ── Save best model ────────────────────────────────────
+    if vl_loss < best_val:
+        best_val = vl_loss
+        torch.save({
+            "epoch":      epoch,
+            "state_dict": model.state_dict(),
+            "optim":      optimizer.state_dict(),
+            "val_loss":   vl_loss,
+            "val_dice":   vl_dice,
+        }, os.path.join(SAVE_DIR, "carvingnet_best.pth"))
+        print(f"  ✓ Best model saved  (val_loss={vl_loss:.4f})")
+
+    # ── Save checkpoint every 50 epochs ───────────────────
+    if epoch % 50 == 0:
+        torch.save({
+            "epoch":      epoch,
+            "state_dict": model.state_dict(),
+            "optim":      optimizer.state_dict(),
+            "history":    history,
+        }, os.path.join(SAVE_DIR, f"carvingnet_ep{epoch:03d}.pth"))
+
+total_mins = (time.time() - t0_global) / 60
+print(f"\n[INFO] Training complete in {total_mins:.1f} min.")
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 11 — Plot training curves
+# ════════════════════════════════════════════════════════════
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
+
+for ax, key, title in [
+    (ax1, "loss", "Dice Loss"),
+    (ax2, "dice", "Dice Coefficient"),
+]:
+    ax.plot(history[f"train_{key}"], label="Train", color="royalblue")
+    ax.plot(history[f"val_{key}"],   label="Val",   color="darkorange")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(title)
+    ax.set_title(f"CarvingNet — {title}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+out_curves = "/content/carvingnet_training_curves.png"
+fig.savefig(out_curves, dpi=150)
+print(f"[INFO] Training curves saved to {out_curves}")
+plt.close(fig)
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 12 — Seam carving (dynamic programming)
+# ════════════════════════════════════════════════════════════
+# Content-guided seam carving using the CarvingNet energy map.
+# Equations (6)-(8) from Song et al. 2019.
+
+class SeamCarver:
+    """
+    Content-guided seam carving with CarvingNet deep energy map.
+
+    Usage
+    -----
+    carver = SeamCarver(model, device)
+    resized = carver.resize(image_rgb, target_w, target_h)
+    """
+
+    def __init__(self, net: nn.Module, device: torch.device,
+                 img_size: int = 256):
+        self.net      = net
+        self.device   = device
+        self.img_size = img_size
+        self.net.eval()
+
+    # ── Deep energy map ───────────────────────────────────
+    def energy_map(self, img: np.ndarray) -> np.ndarray:
+        """
+        Run CarvingNet forward pass; return energy map at native resolution.
+
+        Parameters
+        ----------
+        img : uint8 RGB ndarray, shape (H, W, 3)
+
+        Returns
+        -------
+        energy : float32 ndarray, shape (H, W), values ∈ [0, 1]
+        """
+        h_orig, w_orig = img.shape[:2]
+        resized = cv2.resize(img, (self.img_size, self.img_size))
+        x = (resized.astype(np.float32) / 255.0 - _MEAN) / _STD
+        x = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            e = self.net(x).squeeze().cpu().numpy()      # 256×256
+
+        return cv2.resize(e, (w_orig, h_orig))           # back to original size
+
+    # ── Cumulative energy (Eq. 8) ─────────────────────────
+    @staticmethod
+    def _cum_energy_vertical(e: np.ndarray) -> np.ndarray:
+        """
+        M(i,j) = e(i,j) + min(M(i-1,j-1), M(i-1,j), M(i-1,j+1))
+        Vectorised with np.roll for speed.
+        """
+        M = e.copy()
+        h, w = M.shape
+        for i in range(1, h):
+            prev       = M[i - 1]
+            left_shift = np.roll(prev, 1);  left_shift[0]  = prev[0]
+            right_shift= np.roll(prev,-1);  right_shift[-1]= prev[-1]
+            M[i] += np.minimum(np.minimum(prev, left_shift), right_shift)
+        return M
+
+    # ── Find & remove one vertical seam ───────────────────
+    @staticmethod
+    def _find_seam(M: np.ndarray) -> np.ndarray:
+        """Backtrack from minimum in last row — Eq.(6)."""
+        h, w  = M.shape
+        seam  = np.empty(h, dtype=np.int32)
+        seam[-1] = np.argmin(M[-1])
+        for i in range(h - 2, -1, -1):
+            j = seam[i + 1]
+            lo = max(j - 1, 0);  hi = min(j + 2, w)
+            seam[i] = lo + np.argmin(M[i, lo:hi])
+        return seam
+
+    @staticmethod
+    def _remove_seam(arr: np.ndarray, seam: np.ndarray) -> np.ndarray:
+        """Remove one vertical seam from a 2-D or 3-D array."""
+        h, w = arr.shape[:2]
+        mask = np.ones((h, w), dtype=bool)
+        mask[np.arange(h), seam] = False
+        if arr.ndim == 3:
+            return arr[mask].reshape(h, w - 1, arr.shape[2])
+        return arr[mask].reshape(h, w - 1)
+
+    # ── Public resize method ───────────────────────────────
+    def resize(self, img: np.ndarray,
+               target_w: int, target_h: int) -> np.ndarray:
+        """
+        Reduce image to (target_h, target_w) via content-guided seam carving.
+
+        Vertical seams are removed first, then horizontal
+        (image is transposed for horizontal seam removal).
+        """
+        current = img.copy()
+
+        # ── Vertical seam removal (width reduction) ───────
+        n_v = max(0, current.shape[1] - target_w)
+        print(f"[Carver] Removing {n_v} vertical seams …")
+        for k in range(n_v):
+            e    = self.energy_map(current)
+            M    = self._cum_energy_vertical(e)
+            seam = self._find_seam(M)
+            current = self._remove_seam(current, seam)
+            if (k + 1) % max(1, n_v // 5) == 0 or k == n_v - 1:
+                print(f"  vertical  {k+1:>4d}/{n_v}  →  "
+                      f"{current.shape[1]}×{current.shape[0]}")
+
+        # ── Horizontal seam removal (height reduction) ─────
+        # Transpose image so horizontal seams become vertical
+        n_h = max(0, current.shape[0] - target_h)
+        print(f"[Carver] Removing {n_h} horizontal seams …")
+        current = current.transpose(1, 0, 2)   # W×H×C
+        for k in range(n_h):
+            e    = self.energy_map(current)
+            M    = self._cum_energy_vertical(e)
+            seam = self._find_seam(M)
+            current = self._remove_seam(current, seam)
+            if (k + 1) % max(1, n_h // 5) == 0 or k == n_h - 1:
+                print(f"  horizontal {k+1:>4d}/{n_h}  →  "
+                      f"{current.shape[1]}×{current.shape[0]}")
+        current = current.transpose(1, 0, 2)   # back to H×W×C
+
+        return current
+
+
+# ════════════════════════════════════════════════════════════
+# CELL 13 — Inference & demo visualisation
+# ════════════════════════════════════════════════════════════
+
+# ── Load best checkpoint ───────────────────────────────────
+ckpt = torch.load(os.path.join(SAVE_DIR, "carvingnet_best.pth"),
+                  map_location=device)
+model.load_state_dict(ckpt["state_dict"])
+model.eval()
+print(f"[INFO] Loaded checkpoint from epoch {ckpt['epoch']}  "
+      f"(val_loss={ckpt['val_loss']:.4f}, val_dice={ckpt['val_dice']:.4f})")
+
+carver = SeamCarver(model, device)
+
+# ── Pick a test image ─────────────────────────────────────
+test_dir = os.path.join(DATA_DIR, "images", "test")
+test_imgs = sorted(f for f in os.listdir(test_dir) if f.endswith(".jpg"))
+test_path = os.path.join(test_dir, test_imgs[0])
+
+img_bgr = cv2.imread(test_path)
+img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+print(f"[INFO] Test image   : {test_imgs[0]}  "
+      f"({img_rgb.shape[1]}×{img_rgb.shape[0]})")
+
+# ── Generate deep energy map ──────────────────────────────
+energy = carver.energy_map(img_rgb)
+print(f"[INFO] Energy range : [{energy.min():.3f}, {energy.max():.3f}]")
+
+# ── Seam carve: reduce width by 25 % ──────────────────────
+tgt_w = int(img_rgb.shape[1] * 0.75)
+tgt_h = img_rgb.shape[0]
+carved = carver.resize(img_rgb, target_w=tgt_w, target_h=tgt_h)
+print(f"[INFO] Carved size  : {carved.shape[1]}×{carved.shape[0]}")
+
+# ── Visualisation ─────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+axes[0].imshow(img_rgb)
+axes[0].set_title(f"Original  ({img_rgb.shape[1]}×{img_rgb.shape[0]})")
+axes[0].axis("off")
+
+im = axes[1].imshow(energy, cmap="hot", vmin=0, vmax=1)
+axes[1].set_title("CarvingNet — Deep Energy Map")
+axes[1].axis("off")
+fig.colorbar(im, ax=axes[1], fraction=0.046)
+
+axes[2].imshow(carved)
+axes[2].set_title(
+    f"Seam-Carved  ({carved.shape[1]}×{carved.shape[0]}, −25% width)")
+axes[2].axis("off")
+
+plt.suptitle("CarvingNet (Song et al., IEEE Access 2019)", fontsize=13,
+             fontweight="bold")
+plt.tight_layout()
+out_demo = "/content/carvingnet_demo.png"
+fig.savefig(out_demo, dpi=150, bbox_inches="tight")
+print(f"[INFO] Demo figure  saved to {out_demo}")
+plt.close(fig)
+
+print("\n[DONE] CarvingNet training & inference complete.")
