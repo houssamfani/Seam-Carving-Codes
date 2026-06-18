@@ -1,0 +1,164 @@
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from google.colab import files
+
+class QLearningSeamCarver:
+    def __init__(self, gamma=0.9, gamma1=1.0, gamma2=1.0):
+        self.gamma = gamma
+        self.gamma1 = gamma1
+        self.gamma2 = gamma2
+
+    def compute_energy(self, img):
+        """Calcule l'énergie via l'équation 2 du document."""
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
+
+        gray = gray.astype(np.float64)
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+
+        # e(I) = |dI/dx| + |dI/dy|
+        energy = np.abs(sobelx) + np.abs(sobely)
+        return energy
+
+    def find_optimal_seam(self, energy, use_special_point=False):
+        """
+        Trouve le seam optimal en utilisant l'approche Q-Learning et le Point Spécial.
+        """
+        H, W = energy.shape
+        M = np.zeros((H, W))
+        backtrack = np.zeros((H, W), dtype=int)
+
+        # Initialisation de la première ligne
+        M[0, :] = energy[0, :]
+
+        for i in range(1, H):
+            for j in range(W):
+                # Actions possibles : haut-gauche, haut-centre, haut-droite
+                valid_actions = []
+                if j > 0:
+                    valid_actions.append(j - 1)
+                valid_actions.append(j)
+                if j < W - 1:
+                    valid_actions.append(j + 1)
+
+                # Application du "Special Point" : on ne garde que 2 actions au lieu de 3
+                if use_special_point and len(valid_actions) == 3:
+                    # On retire l'action menant au pixel ayant la plus haute énergie
+                    # pour simuler l'utilisation restreinte à deux pixels.
+                    energies_prev = [energy[i-1, v] for v in valid_actions]
+                    max_idx = np.argmax(energies_prev)
+                    valid_actions.pop(max_idx)
+
+                best_q_value = float('inf')
+                best_action = -1
+
+                for v_j in valid_actions:
+                    # Calcul de la récompense (Eq 4)
+                    r = self.gamma1 * energy[i, j] + self.gamma2 * energy[i-1, v_j]
+
+                    # Calcul de la valeur Q (minimisation des coûts d'énergie)
+                    # Q(s,a) = r + gamma * min(Q(s', a'))
+                    q_value = r + self.gamma * M[i-1, v_j]
+
+                    if q_value < best_q_value:
+                        best_q_value = q_value
+                        best_action = v_j
+
+                # Mise à jour de la matrice M avec l'énergie actuelle + la meilleure valeur Q (Eq 5)
+                M[i, j] = energy[i, j] + best_q_value
+                backtrack[i, j] = best_action
+
+        # Backtracking pour reconstruire le seam depuis la dernière ligne
+        seam = []
+        j = np.argmin(M[-1, :])
+        for i in range(H-1, -1, -1):
+            seam.append(j)
+            if i > 0:
+                j = backtrack[i, j]
+
+        return seam[::-1]
+
+    def remove_seam(self, img, seam):
+        """Supprime le seam identifié de l'image."""
+        H, W = img.shape[:2]
+        if len(img.shape) == 3:
+            output = np.zeros((H, W - 1, 3), dtype=img.dtype)
+            for i in range(H):
+                col = seam[i]
+                output[i, :col] = img[i, :col]
+                output[i, col:] = img[i, col+1:]
+        else:
+            output = np.zeros((H, W - 1), dtype=img.dtype)
+            for i in range(H):
+                col = seam[i]
+                output[i, :col] = img[i, :col]
+                output[i, col:] = img[i, col+1:]
+        return output
+
+    def resize_image(self, img, num_seams, alpha):
+        """
+        Redimensionne l'image en appliquant la logique d'Alpha et du Point Spécial.
+        """
+        current_img = img.copy()
+
+        print(f"Démarrage du redimensionnement (Coutures à retirer : {num_seams}, Alpha : {alpha})")
+
+        for step in range(num_seams):
+            energy = self.compute_energy(current_img)
+
+            # Le "Special Point" est activé une fois que le nombre d'itérations atteint la valeur Alpha
+            use_special_point = (step >= alpha)
+
+            seam = self.find_optimal_seam(energy, use_special_point=use_special_point)
+            current_img = self.remove_seam(current_img, seam)
+
+            if (step + 1) % 10 == 0 or (step + 1) == num_seams:
+                print(f"Progression : {step + 1}/{num_seams} coutures supprimées (Point Spécial actif : {use_special_point})")
+
+        return current_img
+
+# ============================================
+# EXÉCUTION DANS COLAB
+# ============================================
+
+def run_q_learning_seam_carving():
+    print("📤 Veuillez sélectionner une image à traiter :")
+    uploaded = files.upload()
+
+    if not uploaded:
+        print("Aucune image téléchargée.")
+        return
+
+    filename = list(uploaded.keys())[0]
+    file_bytes = np.frombuffer(uploaded[filename], np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    # Paramètres de redimensionnement
+    num_seams_to_remove = int(input("Combien de coutures verticales souhaitez-vous retirer ? (ex: 50) : "))
+    alpha_value = int(input("Entrez la valeur d'Alpha (ex: 20) : "))
+
+    # Initialisation de l'agent Q-Learning
+    carver = QLearningSeamCarver(gamma=0.9, gamma1=1.0, gamma2=1.0)
+
+    # Traitement
+    result_img = carver.resize_image(img, num_seams_to_remove, alpha_value)
+
+    # Affichage des résultats
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7))
+    axes[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    axes[0].set_title(f"Image Originale ({img.shape[1]}x{img.shape[0]})")
+    axes[0].axis('off')
+
+    axes[1].imshow(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB))
+    axes[1].set_title(f"Résultat Q-Learning ({result_img.shape[1]}x{result_img.shape[0]})")
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+
+run_q_learning_seam_carving()
