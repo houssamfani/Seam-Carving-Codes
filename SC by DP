@@ -1,0 +1,561 @@
+# ============================================
+# SEAM CARVING ALGORITHM for Google Colab
+# Dynamic Programming Implementation
+# ============================================
+
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from skimage import filters
+import time
+from google.colab import files
+import io
+from IPython.display import display, clear_output
+
+class SeamCarving:
+    """
+    Implémentation complète de l'algorithme Seam Carving
+    avec programmation dynamique pour Google Colab
+    """
+
+    def __init__(self):
+        self.image = None
+        self.original = None
+        self.energy_maps = []
+        self.seam_history = []
+
+    def upload_image(self):
+        """Upload une image depuis l'ordinateur vers Colab"""
+        print("📤 Veuillez sélectionner une image...")
+        uploaded = files.upload()
+
+        for filename in uploaded.keys():
+            # Lire l'image
+            file_bytes = np.frombuffer(uploaded[filename], np.uint8)
+            self.image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            self.original = self.image.copy()
+            print(f"✅ Image chargée: {filename}")
+            print(f"   Dimensions: {self.image.shape[1]} x {self.image.shape[0]}")
+            return filename
+
+        raise ValueError("Aucune image téléchargée")
+
+    def load_image_from_path(self, path):
+        """Charge une image depuis un chemin (pour les datasets Colab)"""
+        self.image = cv2.imread(path)
+        if self.image is None:
+            raise ValueError(f"Impossible de charger l'image: {path}")
+        self.original = self.image.copy()
+        print(f"✅ Image chargée: {path}")
+        print(f"   Dimensions: {self.image.shape[1]} x {self.image.shape[0]}")
+
+    def compute_energy_map(self, img):
+        """
+        Calcule la carte d'énergie en utilisant le gradient de Sobel
+        """
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
+
+        # Filtre de Sobel pour détecter les contours
+        energy = filters.sobel(gray.astype("float"))
+
+        return energy
+
+    # def compute_energy_map(self, img, protect_faces=True):
+    #     """
+    #     Calcule une carte d'énergie avancée (Scharr + Flou)
+    #     avec détection et protection automatique des sujets importants.
+    #     """
+    #     if len(img.shape) == 3:
+    #         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    #     else:
+    #         gray = img
+
+    #     # 1. Flou gaussien pour réduire le bruit des hautes fréquences (textures inutiles)
+    #     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    #     # 2. Utilisation de Scharr (plus précis et robuste que Sobel)
+    #     grad_x = cv2.Scharr(blurred, cv2.CV_64F, 1, 0)
+    #     grad_y = cv2.Scharr(blurred, cv2.CV_64F, 0, 1)
+
+    #     # Calcul de l'énergie absolue
+    #     energy = np.abs(grad_x) + np.abs(grad_y)
+
+    #     # 3. Protection automatique des visages (Masque d'énergie)
+    #     if protect_faces and len(img.shape) == 3:
+    #         # Charger le modèle de détection de visages pré-entraîné d'OpenCV
+    #         face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    #         # Détection (les paramètres 1.1 et 5 sont standard pour un bon équilibre)
+    #         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+
+    #         for (x, y, w, h) in faces:
+    #             # Calculer une marge de sécurité autour du visage (15%)
+    #             margin_x = int(w * 0.15)
+    #             margin_y = int(h * 0.15)
+
+    #             # S'assurer que les coordonnées restent dans les limites de l'image
+    #             y1, y2 = max(0, y - margin_y), min(energy.shape[0], y + h + margin_y)
+    #             x1, x2 = max(0, x - margin_x), min(energy.shape[1], x + w + margin_x)
+
+    #             # Attribuer une énergie massive pour empêcher le passage des seams
+    #             energy[y1:y2, x1:x2] = 1e6
+
+    #     return energy
+
+
+    def find_vertical_seam(self, energy):
+        """
+        Trouve le seam vertical d'énergie minimale
+        Retourne: seam (liste des colonnes à supprimer)
+        """
+        rows, cols = energy.shape
+
+        # Matrice d'énergie cumulée
+        M = energy.copy()
+
+        # Table de backtracking - stocke le chemin
+        backtrack = np.zeros_like(M, dtype=int)
+
+        # Programmation dynamique
+        for i in range(1, rows):
+            for j in range(cols):
+                if j == 0:
+                    # Bord gauche: seulement 2 voisins
+                    min_idx = np.argmin(M[i-1, j:j+2])
+                    M[i, j] += M[i-1, j + min_idx]
+                    backtrack[i, j] = j + min_idx
+                elif j == cols - 1:
+                    # Bord droit: seulement 2 voisins
+                    min_idx = np.argmin(M[i-1, j-1:j+1])
+                    M[i, j] += M[i-1, j - 1 + min_idx]
+                    backtrack[i, j] = j - 1 + min_idx
+                else:
+                    # Milieu: 3 voisins
+                    min_idx = np.argmin(M[i-1, j-1:j+2])
+                    M[i, j] += M[i-1, j - 1 + min_idx]
+                    backtrack[i, j] = j - 1 + min_idx
+
+        # Reconstruire le seam
+        seam = []
+        j = np.argmin(M[-1])  # Dernière ligne, colonne avec min énergie
+
+        for i in range(rows-1, -1, -1):
+            seam.append(j)
+            if i > 0:
+                j = backtrack[i, j]
+
+        return list(reversed(seam))
+
+    def find_horizontal_seam(self, energy):
+        """
+        Trouve le seam horizontal d'énergie minimale
+        En pratique, on transpose l'énergie et on utilise find_vertical_seam
+        """
+        # Transposer pour utiliser l'algorithme vertical
+        energy_T = energy.T
+        seam_T = self.find_vertical_seam(energy_T)
+        # Le seam horizontal est la transposée
+        return seam_T
+
+    def remove_vertical_seam(self, img, seam):
+        """
+        Supprime un seam vertical de l'image
+        """
+        h, w = img.shape[:2]
+
+        if len(img.shape) == 3:
+            # Image couleur
+            output = np.zeros((h, w-1, 3), dtype=img.dtype)
+            for i in range(h):
+                col = seam[i]
+                output[i, :col] = img[i, :col]
+                output[i, col:] = img[i, col+1:]
+        else:
+            # Image grise
+            output = np.zeros((h, w-1), dtype=img.dtype)
+            for i in range(h):
+                col = seam[i]
+                output[i, :col] = img[i, :col]
+                output[i, col:] = img[i, col+1:]
+
+        return output
+
+    def remove_horizontal_seam(self, img, seam):
+        """
+        Supprime un seam horizontal de l'image
+        """
+        if len(img.shape) == 3:
+            # Image couleur: transposer, supprimer vertical, retransposer
+            img_T = np.transpose(img, (1, 0, 2))
+            output_T = self.remove_vertical_seam(img_T, seam)
+            output = np.transpose(output_T, (1, 0, 2))
+        else:
+            # Image grise
+            img_T = img.T
+            output_T = self.remove_vertical_seam(img_T, seam)
+            output = output_T.T
+
+        return output
+
+    def visualize_seam(self, img, seam, direction='vertical'):
+        """
+        Visualise le seam sur l'image en rouge
+        """
+        vis_img = img.copy()
+        h, w = vis_img.shape[:2]
+
+        if direction == 'vertical':
+            for i, j in enumerate(seam):
+                if 0 <= i < h and 0 <= j < w:
+                    if len(vis_img.shape) == 3:
+                        vis_img[i, j] = [0, 0, 255]  # Rouge en BGR
+                    else:
+                        vis_img[i, j] = 255
+        else:  # horizontal
+            for j, i in enumerate(seam):
+                if 0 <= i < h and 0 <= j < w:
+                    if len(vis_img.shape) == 3:
+                        vis_img[i, j] = [0, 0, 255]
+                    else:
+                        vis_img[i, j] = 255
+
+        return vis_img
+
+    def resize_vertical(self, num_seams, visualize_every=10):
+        """
+        Redimensionne l'image en supprimant des seams verticaux
+        """
+        img = self.image.copy()
+        seams_removed = 0
+        history = []
+
+        print(f"🔄 Suppression de {num_seams} seams verticaux...")
+        start_time = time.time()
+
+        for i in range(num_seams):
+            # Calculer la carte d'énergie
+            energy = self.compute_energy_map(img)
+
+            # Trouver le seam optimal
+            seam = self.find_vertical_seam(energy)
+
+            # Visualisation périodique
+            if visualize_every > 0 and (i % visualize_every == 0 or i == num_seams-1):
+                vis_img = self.visualize_seam(img, seam, 'vertical')
+                history.append({
+                    'step': i+1,
+                    'image': vis_img,
+                    'seam': seam,
+                    'dimensions': img.shape
+                })
+
+            # Supprimer le seam
+            img = self.remove_vertical_seam(img, seam)
+            seams_removed += 1
+
+            # Progression
+            if (i+1) % 10 == 0 or i+1 == num_seams:
+                print(f"   Progression: {i+1}/{num_seams} seams supprimés")
+
+        elapsed = time.time() - start_time
+        print(f"✅ Terminé en {elapsed:.2f} secondes")
+        print(f"   Dimensions finales: {img.shape[1]} x {img.shape[0]}")
+
+        return img, history
+
+    def resize_horizontal(self, num_seams, visualize_every=10):
+        """
+        Redimensionne l'image en supprimant des seams horizontaux
+        """
+        img = self.image.copy()
+        seams_removed = 0
+        history = []
+
+        print(f"🔄 Suppression de {num_seams} seams horizontaux...")
+        start_time = time.time()
+
+        for i in range(num_seams):
+            # Calculer la carte d'énergie
+            energy = self.compute_energy_map(img)
+
+            # Trouver le seam optimal
+            seam = self.find_horizontal_seam(energy)
+
+            # Visualisation périodique
+            if visualize_every > 0 and (i % visualize_every == 0 or i == num_seams-1):
+                vis_img = self.visualize_seam(img, seam, 'horizontal')
+                history.append({
+                    'step': i+1,
+                    'image': vis_img,
+                    'seam': seam,
+                    'dimensions': img.shape
+                })
+
+            # Supprimer le seam
+            img = self.remove_horizontal_seam(img, seam)
+            seams_removed += 1
+
+            # Progression
+            if (i+1) % 10 == 0 or i+1 == num_seams:
+                print(f"   Progression: {i+1}/{num_seams} seams supprimés")
+
+        elapsed = time.time() - start_time
+        print(f"✅ Terminé en {elapsed:.2f} secondes")
+        print(f"   Dimensions finales: {img.shape[1]} x {img.shape[0]}")
+
+        return img, history
+
+    def resize_to_dimensions(self, new_width, new_height, visualize=True):
+        """
+        Redimensionne l'image à des dimensions spécifiques
+        """
+        img = self.image.copy()
+        current_h, current_w = img.shape[:2]
+
+        print(f"📐 Redimensionnement de {current_w}x{current_h} → {new_width}x{new_height}")
+
+        # Supprimer les seams horizontaux
+        seams_h = current_h - new_height
+        if seams_h > 0:
+            print(f"\n📏 Suppression de {seams_h} seams horizontaux")
+            img, _ = self.resize_horizontal(seams_h, visualize_every=0)
+            self.image = img  # Mettre à jour l'image courante
+
+        # Supprimer les seams verticaux
+        seams_w = current_w - new_width
+        if seams_w > 0:
+            print(f"\n📏 Suppression de {seams_w} seams verticaux")
+            img, _ = self.resize_vertical(seams_w, visualize_every=0)
+
+        if visualize:
+            self.display_result(self.original, img)
+
+        return img
+
+    def display_energy_map(self):
+        """
+        Affiche la carte d'énergie de l'image
+        """
+        energy = self.compute_energy_map(self.image)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Image originale
+        axes[0].imshow(cv2.cvtColor(self.image, cv2.COLOR_BGR2RGB))
+        axes[0].set_title("Image Originale")
+        axes[0].axis('off')
+
+        # Carte d'énergie
+        energy_norm = (energy * 255 / energy.max()).astype(np.uint8)
+        axes[1].imshow(energy_norm, cmap='hot')
+        axes[1].set_title("Carte d'Énergie (zones claires = importantes)")
+        axes[1].axis('off')
+
+        plt.tight_layout()
+        plt.show()
+
+        return energy
+
+    def display_seam_removal_process(self, history, num_cols=4):
+        """
+        Affiche la progression de la suppression des seams
+        """
+        if not history:
+            print("Aucun historique à afficher")
+            return
+
+        n_images = len(history)
+        n_rows = (n_images + num_cols - 1) // num_cols
+
+        fig, axes = plt.subplots(n_rows, num_cols, figsize=(15, 4 * n_rows))
+        axes = axes.flatten() if n_rows > 1 else [axes] if n_images > 1 else [axes]
+
+        for idx, step_data in enumerate(history):
+            img_rgb = cv2.cvtColor(step_data['image'], cv2.COLOR_BGR2RGB)
+            axes[idx].imshow(img_rgb)
+            axes[idx].set_title(f"Étape {step_data['step']}\n{step_data['dimensions'][1]}x{step_data['dimensions'][0]}")
+            axes[idx].axis('off')
+
+        # Cacher les axes inutilisés
+        for idx in range(len(history), len(axes)):
+            axes[idx].axis('off')
+
+        plt.tight_layout()
+        plt.show()
+
+    def display_result(self, original, result):
+        """
+        Affiche l'image originale et le résultat
+        """
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        # Original
+        axes[0].imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
+        axes[0].set_title(f"Originale\n{original.shape[1]} x {original.shape[0]}")
+        axes[0].axis('off')
+
+        # Résultat
+        axes[1].imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+        axes[1].set_title(f"Après Seam Carving\n{result.shape[1]} x {result.shape[0]}")
+        axes[1].axis('off')
+
+        plt.suptitle("Comparaison Original vs Seam Carving", fontsize=14)
+        plt.tight_layout()
+        plt.show()
+
+    def save_result(self, result, filename="seam_carved_result.jpg"):
+        """
+        Sauvegarde le résultat dans Colab et le rend téléchargeable
+        """
+        cv2.imwrite(filename, result)
+        print(f"✅ Image sauvegardée: {filename}")
+
+        # Proposer le téléchargement
+        files.download(filename)
+
+
+# ============================================
+# FONCTIONS PRINCIPALES À EXÉCUTER DANS COLAB
+# ============================================
+
+def demo_quick_start():
+    """
+    Démonstration rapide - à exécuter en premier
+    """
+    print("="*60)
+    print("🎯 SEAM CARVING ALGORITHM - DEMO")
+    print("="*60)
+
+    # Créer l'instance
+    sc = SeamCarving()
+
+    # Upload d'une image
+    sc.upload_image()
+
+    # Afficher la carte d'énergie
+    print("\n📊 Carte d'énergie:")
+    sc.display_energy_map()
+
+    # Choisir l'opération
+    print("\n" + "="*60)
+    print("Que voulez-vous faire?")
+    print("1. Supprimer des seams verticaux")
+    print("2. Supprimer des seams horizontaux")
+    print("3. Redimensionner à des dimensions spécifiques")
+    print("4. Tout essayer")
+
+    choix = input("\nVotre choix (1-4): ")
+
+    if choix == '1':
+        num = int(input("Nombre de seams à supprimer (vertical): "))
+        result, history = sc.resize_vertical(num, visualize_every=max(1, num//5))
+        sc.display_seam_removal_process(history)
+        sc.display_result(sc.original, result)
+        sc.save_result(result)
+
+    elif choix == '2':
+        num = int(input("Nombre de seams à supprimer (horizontal): "))
+        result, history = sc.resize_horizontal(num, visualize_every=max(1, num//5))
+        sc.display_seam_removal_process(history)
+        sc.display_result(sc.original, result)
+        sc.save_result(result)
+
+    elif choix == '3':
+        new_w = int(input("Nouvelle largeur: "))
+        new_h = int(input("Nouvelle hauteur: "))
+        result = sc.resize_to_dimensions(new_w, new_h)
+        sc.save_result(result)
+
+    else:
+        # Demo complète
+        print("\n📹 Démonstration complète...")
+
+        # Supprimer 30 seams verticaux
+        result_v, hist_v = sc.resize_vertical(30)
+        sc.display_seam_removal_process(hist_v)
+
+        # Restaurer l'image originale
+        sc.image = sc.original.copy()
+
+        # Supprimer 20 seams horizontaux
+        result_h, hist_h = sc.resize_horizontal(20)
+        sc.display_seam_removal_process(hist_h)
+
+        sc.save_result(result_h)
+
+
+def demo_with_sample():
+    """
+    Démonstration avec une image de test (sans upload)
+    """
+    print("🎨 Création d'une image de test...")
+
+    # Créer une image de test
+    test_img = np.ones((300, 400, 3), dtype=np.uint8) * 255
+    cv2.rectangle(test_img, (50, 50), (150, 150), (0, 0, 255), -1)  # Rectangle rouge
+    cv2.circle(test_img, (300, 200), 50, (0, 255, 0), -1)  # Cercle vert
+    cv2.line(test_img, (200, 50), (350, 250), (255, 0, 0), 5)  # Ligne bleue
+
+    # Sauvegarder temporairement
+    cv2.imwrite("test_image.jpg", test_img)
+
+    # Charger l'image
+    sc = SeamCarving()
+    sc.load_image_from_path("test_image.jpg")
+
+    # Afficher l'original
+    plt.figure(figsize=(8, 6))
+    plt.imshow(cv2.cvtColor(test_img, cv2.COLOR_BGR2RGB))
+    plt.title("Image de Test Originale")
+    plt.axis('off')
+    plt.show()
+
+    # Supprimer des seams
+    result, history = sc.resize_vertical(100)
+    sc.display_seam_removal_process(history, num_cols=3)
+    sc.display_result(sc.original, result)
+
+
+def batch_process_example():
+    """
+    Exemple de traitement par lots
+    """
+    print("🚀 Traitement par lots d'images...")
+
+    # Créer plusieurs images de test
+    images = []
+    sc = SeamCarving()
+
+    for i in range(3):
+        img = np.random.randint(0, 255, (200, 300, 3), dtype=np.uint8)
+        cv2.putText(img, f"Image {i+1}", (50, 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.imwrite(f"test_{i}.jpg", img)
+        images.append(f"test_{i}.jpg")
+
+    # Traiter chaque image
+    for path in images:
+        print(f"\n📷 Traitement de {path}")
+        sc.load_image_from_path(path)
+        result = sc.resize_vertical(50, visualize_every=0)
+        sc.save_result(result, f"result_{path}")
+
+
+# ============================================
+# EXÉCUTION PRINCIPALE
+# ============================================
+
+if __name__ == "__main__":
+
+
+    # Option 1: Démarrer la démo (recommandé)
+    demo_quick_start()
+
+    # Option 2: Utiliser une image de test
+    # demo_with_sample()
+
+    # Option 3: Traitement par lots
+    # batch_process_example()
